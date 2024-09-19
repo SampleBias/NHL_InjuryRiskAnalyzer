@@ -7,10 +7,14 @@ import shap
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.impute import SimpleImputer
 import joblib
 import os
 import logging
 from typing import Tuple, Optional
+
+# Import functions from the data processor module
+from data_processor import create_dummy_data, preprocess_data, train_model
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -19,58 +23,80 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 PROCESSED_DATA_PATH = 'nhl_processed_injury_data.pkl'
 MODEL_PATH = 'nhl_injury_model.joblib'
 SCALER_PATH = 'nhl_injury_scaler.joblib'
+FEATURE_NAMES_PATH = 'feature_names.joblib'
+
+# Define the feature names explicitly
+FEATURE_NAMES = ['Age', 'GP', 'G', 'A', 'P', '+/-', 'PIM', 'TOI', 'Position_Forward', 'Position_Defenseman', 'Position_Goalie', 'SV%', 'GAA']
 
 @st.cache_data
-def load_data() -> Optional[pd.DataFrame]:
+def load_or_create_data() -> Optional[pd.DataFrame]:
     if os.path.exists(PROCESSED_DATA_PATH):
         try:
-            return pd.read_pickle(PROCESSED_DATA_PATH)
+            df = pd.read_pickle(PROCESSED_DATA_PATH)
+            return clean_data(df)
         except Exception as e:
             st.error(f"Error loading data: {e}")
             return None
     else:
-        st.error(f"Processed data not found at {PROCESSED_DATA_PATH}")
-        return None
+        st.info("Processed data not found. Creating new dummy data.")
+        df = create_dummy_data()
+        X, y, df_processed = preprocess_data(df)
+        df_processed.to_pickle(PROCESSED_DATA_PATH)
+        return clean_data(df_processed)
+
+def clean_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Clean the data by handling NaN values."""
+    # Fill NaN values with mean for numeric columns
+    numeric_columns = df.select_dtypes(include=[np.number]).columns
+    imputer = SimpleImputer(strategy='mean')
+    df[numeric_columns] = imputer.fit_transform(df[numeric_columns])
+    
+    # For categorical columns (if any), fill with mode
+    categorical_columns = df.select_dtypes(include=['object', 'category']).columns
+    df[categorical_columns] = df[categorical_columns].fillna(df[categorical_columns].mode().iloc[0])
+    
+    return df
 
 @st.cache_resource
-def train_and_load_model(X, y) -> Tuple[Optional[object], Optional[object]]:
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+def load_or_train_model(X: pd.DataFrame, y: pd.Series) -> Tuple[Optional[RandomForestClassifier], Optional[StandardScaler]]:
+    if os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH) and os.path.exists(FEATURE_NAMES_PATH):
+        try:
+            model = joblib.load(MODEL_PATH)
+            scaler = joblib.load(SCALER_PATH)
+            saved_feature_names = joblib.load(FEATURE_NAMES_PATH)
+            if not all(X.columns == saved_feature_names):
+                raise ValueError("Loaded feature names do not match current data")
+            return model, scaler
+        except Exception as e:
+            st.error(f"Error loading model, scaler, or feature names: {e}")
     
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    
-    model = RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced')
-    model.fit(X_train_scaled, y_train)
-    
+    st.info("Model not found or feature mismatch. Training new model.")
+    X = X[FEATURE_NAMES]  # Ensure consistent feature order
+    model, scaler = train_model(X, y)
+    joblib.dump(model, MODEL_PATH)
+    joblib.dump(scaler, SCALER_PATH)
+    joblib.dump(X.columns, FEATURE_NAMES_PATH)
     return model, scaler
 
-def predict_injury_risk(model, scaler, df_processed, input_data):
+def predict_injury_risk(model: RandomForestClassifier, scaler: StandardScaler, df_processed: pd.DataFrame, input_data: dict) -> Tuple[Optional[int], Optional[float]]:
     if model is None or scaler is None:
         st.error("Model or scaler not available. Unable to make prediction.")
         return None, None
 
     new_data = pd.DataFrame([input_data])
-    feature_names = df_processed.drop(['Injured', 'player_name'], axis=1).columns
-    new_data = new_data.reindex(columns=feature_names, fill_value=0)
-    
-    # Handle the case where position columns are not in the data
-    for pos in ['Position_Forward', 'Position_Defenseman', 'Position_Goalie']:
-        if pos not in new_data.columns and 'Position' in new_data.columns:
-            new_data[pos] = (new_data['Position'] == pos.split('_')[1]).astype(int)
-    if 'Position' in new_data.columns:
-        new_data = new_data.drop('Position', axis=1)
+    new_data = new_data.reindex(columns=FEATURE_NAMES, fill_value=0)
     
     X_new_scaled = scaler.transform(new_data)
     risk_probability = model.predict_proba(X_new_scaled)[0][1]
     risk_prediction = model.predict(X_new_scaled)[0]
     return risk_prediction, risk_probability
 
-def predict_injury_risk_for_all(model, scaler, df_processed):
+def predict_injury_risk_for_all(model: RandomForestClassifier, scaler: StandardScaler, df_processed: pd.DataFrame) -> Optional[pd.DataFrame]:
     if model is None or scaler is None:
         st.error("Model or scaler not available. Unable to make predictions.")
         return None
 
-    X = df_processed.drop(['Injured', 'player_name'], axis=1)
+    X = df_processed[FEATURE_NAMES]
     X_scaled = scaler.transform(X)
     y_probs = model.predict_proba(X_scaled)[:, 1]
     y_pred = (y_probs > 0.5).astype(int)
@@ -80,7 +106,7 @@ def predict_injury_risk_for_all(model, scaler, df_processed):
         'Injury_Risk_Probability': y_probs
     })
 
-def plot_feature_importance(model, feature_names, top_n=15):
+def plot_feature_importance(model: RandomForestClassifier, feature_names: np.ndarray, top_n: int = 15):
     if model is None:
         st.error("Model not available. Unable to plot feature importance.")
         return
@@ -93,9 +119,8 @@ def plot_feature_importance(model, feature_names, top_n=15):
     fig, ax = plt.subplots(figsize=(10, 6))
     sns.barplot(x=top_importances, y=top_features, ax=ax)
     ax.set_title(f'Top {top_n} Feature Importances')
-    st.pyplot(fig)
-
-def display_player_stats(player_data):
+    st.pyplot(fig)  
+def display_player_stats(player_data: pd.DataFrame):
     st.subheader("Player Statistics")
     
     col1, col2 = st.columns(2)
@@ -125,7 +150,7 @@ def display_player_stats(player_data):
             st.metric("+/-", f"{player_data['+/-'].iloc[0]}" if '+/-' in player_data.columns else 'N/A')
             st.metric("TOI/G", f"{player_data['TOI'].iloc[0]:.2f}" if 'TOI' in player_data.columns else 'N/A')
 
-def get_injury_prevention_recommendation(injury_risk_pred):
+def get_injury_prevention_recommendation(injury_risk_pred: int) -> str:
     if injury_risk_pred == 1:
         return ("Injury Prevention Recommendation: "
                 "Implement a tailored injury prevention program focusing on high-risk areas. "
@@ -137,19 +162,20 @@ def get_injury_prevention_recommendation(injury_risk_pred):
                 "Continue with the current training regimen while monitoring for any signs of fatigue or discomfort. "
                 "Regular check-ins with the medical staff, proper nutrition, and adequate rest "
                 "will help maintain the player's low injury risk status.")
+
 def main():
     st.set_page_config(page_title="NHL Injury Risk Prediction App", page_icon="🏒")
     st.title("NHL Injury Risk Prediction App 🏒")
     
-    df_processed = load_data()
+    df_processed = load_or_create_data()
     
     if df_processed is None:
         st.warning("Data not available. Some features may be limited.")
         return
     
-    X = df_processed.drop(['Injured', 'player_name'], axis=1)
+    X = df_processed[FEATURE_NAMES]
     y = df_processed['Injured']
-    model, scaler = train_and_load_model(X, y)
+    model, scaler = load_or_train_model(X, y)
     
     if model is None or scaler is None:
         st.warning("Model or scaler not available. Predictions cannot be made.")
@@ -254,8 +280,7 @@ def main():
         st.subheader("Data Visualization")
         
         st.write("""
-        This section provides insights into how our model makes predictions. We use two main visualization techniques:
-        Feature Importance and SHAP (SHapley Additive exPlanations) values.
+        This section provides insights into how our model makes predictions. We use feature importance visualization.
         """)
         
         st.subheader("Feature Importance")
@@ -265,19 +290,42 @@ def main():
         """)
         plot_feature_importance(model, X.columns, top_n=15)
         
-        st.subheader("SHAP Summary Plot")
+        st.subheader("Additional Feature Analysis")
         st.write("""
-        SHAP values provide a more detailed view of feature importance. They show how each feature 
-        impacts the model output for each prediction. 
+        Let's take a closer look at how individual features relate to injury risk.
+        """)
         
-        - Features are ranked by importance from top to bottom.
-        - Colors indicate whether the feature value is high (red) or low (blue) for that observation.
-        - The horizontal location shows whether the effect of that value caused a higher or lower prediction.
+        # Select a feature for analysis
+        feature_to_analyze = st.selectbox("Select a feature to analyze:", FEATURE_NAMES)
+        
+        # Create a plot showing the relationship between the selected feature and injury risk
+        fig, ax = plt.subplots(figsize=(10, 6))
+        sns.boxplot(x='Injured', y=feature_to_analyze, data=df_processed, ax=ax)
+        ax.set_title(f'Relationship between {feature_to_analyze} and Injury Risk')
+        ax.set_xlabel('Injured (0 = No, 1 = Yes)')
+        ax.set_ylabel(feature_to_analyze)
+        st.pyplot(fig)
+        
+        st.write(f"""
+        This box plot shows the distribution of {feature_to_analyze} for players who were not injured (0) and those who were injured (1).
+        The box represents the interquartile range (IQR), the line inside the box is the median, and the whiskers extend to show the rest of the distribution.
+        Points beyond the whiskers are outliers.
+        
+        Interpreting the plot:
+        - If the boxes for 0 and 1 are at different levels, it suggests that {feature_to_analyze} might be associated with injury risk.
+        - If the boxes overlap significantly, it might indicate that {feature_to_analyze} alone is not strongly predictive of injury risk.
+        - Keep in mind that our model considers multiple features together, which can reveal patterns that aren't visible when looking at single features.
+        """)
+        
+        st.write("""
+        Note: We've replaced the SHAP values visualization due to compatibility issues with the current version of NumPy. 
+        SHAP values provide a more detailed view of feature importance, showing how each feature impacts the model output for each prediction.
+        If you're interested in SHAP values, you might need to use a different version of the libraries or explore alternative explanation methods.
         """)
         explainer = shap.TreeExplainer(model)
         
         # Prepare the data for SHAP
-        X_sample = X.sample(min(100, len(X)))  # Sample up to 100 rows
+        X_sample = X.sample(min(100, len(X)))
         X_sample_scaled = scaler.transform(X_sample)
         
         # Generate SHAP values
@@ -338,4 +386,3 @@ if __name__ == "__main__":
     except Exception as e:
         st.error(f"An unexpected error occurred: {e}")
         logging.exception("An error occurred in the Streamlit app")
-
