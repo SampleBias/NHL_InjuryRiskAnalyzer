@@ -137,7 +137,6 @@ def get_injury_prevention_recommendation(injury_risk_pred):
                 "Continue with the current training regimen while monitoring for any signs of fatigue or discomfort. "
                 "Regular check-ins with the medical staff, proper nutrition, and adequate rest "
                 "will help maintain the player's low injury risk status.")
-
 def main():
     st.set_page_config(page_title="NHL Injury Risk Prediction App", page_icon="🏒")
     st.title("NHL Injury Risk Prediction App 🏒")
